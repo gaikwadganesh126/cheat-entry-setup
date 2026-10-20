@@ -183,7 +183,8 @@ def _history(t, period, interval):
                 df.index = df.index.tz_localize(None)
             return df.dropna(subset=["Close"])
         except Exception:
-            time.sleep(2 * (i + 1))
+            if i < CFG["retries"]:
+                time.sleep(5 * (2 ** i))
     return None
 
 
@@ -326,7 +327,10 @@ def run_scan(symbols, names=None, log=print, group=FINAL, check_all=False):
     for key, ts in INDICES.items():
         t = next((t for t in ts if t in raw), None)
         if t is None:
-            raise RuntimeError(f"No index data for {key}; update INDICES")
+            raise RuntimeError(
+                f"No Yahoo Finance history for {key} (tried {', '.join(ts)}). "
+                "Yahoo Finance may be temporarily rate-limiting requests; wait a few minutes and retry."
+            )
         idx[key] = raw[t]["Close"]
 
     log(f"Downloading weekly data for {len(symbols)} stocks (< 5 years of data = skipped)...")
