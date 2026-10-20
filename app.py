@@ -1,0 +1,247 @@
+"""
+Cheat Entry Ranking System | Streamlit dashboard (Hugging Face Spaces).
+Run locally: streamlit run app.py
+The screening logic lives in screener.py.
+"""
+import datetime as dt
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+import screener as s
+
+st.set_page_config(page_title="Cheat Entry Ranking System", page_icon="⚡", layout="wide")
+
+CACHE_TTL = 4 * 3600  # scans are shared by all users for 4 hours
+SETUPS = [g for g in s.GROUPS if g != "All conditions"]
+ICONS = {"Y": "✅", "N": "❌", "-": "➖"}
+
+# Short, readable names shown in the UI instead of C1..C13 / F1..F7
+SHORT = {
+    "C1": "Mkt Cap", "C2": "5Y Uptrend", "C3": "ATH Pullback", "C4": "RS CNX500 50D",
+    "C5": "RS Nifty50", "C6": "RS CNX500", "C7": "RS Midcap50", "C8": "RS Smallcap250",
+    "C9": "Vol Surge", "C10": "Red Vol Dry", "C11": "Small Wick", "C12": "Vol Ratio",
+    "C13": "RSI > 55", "F1": "Prior Trend", "F2": "Above Fib", "F3": "Above DMAs",
+    "F4": "ATH Room", "F5": "ATH Dash OK", "F6": "Multi RS OK", "F7": "Above AVWAP",
+}
+
+
+def rules_md(keys):
+    return "\n".join(f"- **{SHORT[k]}** — {s.LABELS[k]}" for k in keys)
+
+
+def signal(n_failed, final):
+    if n_failed == 0:
+        return "🟢 PASS"
+    return "🔴 FAIL" if final or n_failed > 1 else "🟡 WATCH"
+
+
+# ====================================================================== STYLE
+st.markdown("""<style>
+.block-container{padding-top:1.5rem;max-width:1400px}
+.hero{background:linear-gradient(135deg,#0b1f3a 0%,#123a6b 55%,#1e5bb8 100%);
+      padding:26px 20px;border-radius:16px;text-align:center;
+      box-shadow:0 8px 24px rgba(0,0,0,.35);margin-bottom:18px}
+.hero h1{color:#fff;margin:0;font-size:34px;font-weight:800;letter-spacing:.5px}
+.hero p{color:#c9d6ea;margin:6px 0 0;font-size:16px}
+.chip{display:inline-block;padding:4px 12px;border-radius:999px;margin:0 4px;
+      background:#111827;border:1px solid #1f2937;color:#e5e7eb;font-size:13px}
+section[data-testid="stSidebar"] .stButton button{border-radius:10px;font-weight:600}
+div[data-testid="stDataFrame"]{border-radius:12px;overflow:hidden}
+</style>""", unsafe_allow_html=True)
+
+
+# ====================================================================== ABOUT
+@st.dialog("ℹ️ About — Cheat Entry Ranking System", width="large")
+def about():
+    st.markdown("""
+Scans NSE stocks on the **weekly chart** and ranks positional swing *cheat entries*:
+strong long-term leaders that pulled back from their all-time high (ATH) and are
+turning up again with relative strength and volume.
+
+**How it works**
+1. Choose a **setup** and a **universe** (index, all NSE stocks, or your watchlist), press **SCAN**.
+2. Weekly candles come from Yahoo Finance; stocks with less than 5 years of data are skipped.
+3. Every stock is tested against **all conditions**; results show the selected setup.
+
+| Signal | Meaning |
+|---|---|
+| 🟢 **PASS** | every check of the setup passes |
+| 🟡 **WATCH** | only one check missed (ATH Dashboard / Multi RS only) |
+| 🔴 **FAIL** | setup not met |
+""")
+    for g in SETUPS:
+        keys = s.GROUPS[g]
+        with st.expander(f"**{g}** — {len(keys)} checks", expanded=g == s.FINAL):
+            st.markdown(rules_md(keys))
+    st.markdown("**Benchmarks:** CNX500 · NIFTY 50 · NIFTY Midcap 50 · NIFTY Smallcap 250")
+    st.caption("Weekly signals are final after the Friday close. For education only, not investment advice.")
+
+
+# ====================================================================== CACHED DATA
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def symbols(index):
+    return s.nse_symbols(index)
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def scan(syms, names, group, check_all):
+    sl, all_df = s.run_scan(list(syms), dict(names), lambda *_: None, group, check_all)
+    return sl, all_df
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def weekly(ticker):
+    return s._history(ticker, "3y", "1wk")
+
+
+# ====================================================================== SIDEBAR
+with st.sidebar:
+    st.markdown("## ⚙️ Scanner")
+    group = st.selectbox("Setup", SETUPS, index=0)
+    universe = st.radio("Universe", ["Index", "All NSE stocks", "Watchlist"], horizontal=True)
+    index, watch = None, ""
+    if universe == "Index":
+        names_ = list(s.INDEX_LISTS)
+        index = st.selectbox("Index", names_, index=names_.index("Nifty 500"))
+    elif universe == "Watchlist":
+        watch = st.text_area("Symbols", placeholder="HAL, TCS, BEL", height=100)
+    else:
+        st.caption("~2,000 stocks · first run takes 5-10 minutes")
+    go_btn = st.button("⚡ SCAN", type="primary", width="stretch")
+    if st.button("🔄 Clear cache", width="stretch"):
+        st.cache_data.clear()
+        st.session_state.pop("res", None)
+
+
+# ====================================================================== HEADER
+_, mid, right = st.columns([1, 6, 1], vertical_alignment="center")
+with mid:
+    st.markdown("""<div class="hero"><h1>⚡ Cheat Entry</h1>
+<p>Cheat Entry Ranking System</p></div>""", unsafe_allow_html=True)
+with right:
+    if st.button("ℹ️ About", width="stretch"):
+        about()
+
+
+# ====================================================================== RUN SCAN
+if go_btn:
+    is_watch = universe == "Watchlist"
+    try:
+        if is_watch:
+            syms = s.parse_manual(watch)
+            if not syms:
+                st.error("Type at least one symbol."); st.stop()
+            try:
+                names = symbols(None)
+            except Exception:
+                names = {}
+        else:
+            names = symbols(index)
+            syms = list(names)
+        with st.spinner(f"Scanning {len(syms)} stocks... this can take a few minutes"):
+            sl, all_df = scan(tuple(syms), tuple(sorted(names.items())), group, is_watch)
+        st.session_state["res"] = dict(sl=sl, all_df=all_df, group=group, watch=is_watch, syms=syms)
+    except Exception as e:
+        st.error(f"Scan failed: {e}")
+
+res = st.session_state.get("res")
+if not res:
+    st.markdown("<div style='text-align:center;margin-top:40px'>"
+                "<span class='chip'>📅 Weekly timeframe</span>"
+                "<span class='chip'>🇮🇳 NSE stocks</span>"
+                "<span class='chip'>📈 Positional swing</span>"
+                "<p style='margin-top:22px;color:#9ca3af'>👈 Choose a setup and universe, "
+                "then press <b>⚡ SCAN</b></p></div>", unsafe_allow_html=True)
+    st.stop()
+
+
+# ====================================================================== RESULTS
+all_df, final = res["all_df"], res["group"] == s.FINAL
+view = (all_df.sort_values(["n_failed", "rsi14w"], ascending=[True, False]) if res["watch"]
+        else res["sl"])
+
+final_keys = s.GROUPS[s.FINAL]
+check_help = {SHORT[k]: st.column_config.TextColumn(SHORT[k], help=s.LABELS[k], width="small")
+              for k in s.LABELS}
+
+
+def check_table(keys, score_col):
+    t = pd.DataFrame({
+        "Symbol": view["symbol"].values,
+        "Chart": ("https://www.tradingview.com/chart/?symbol=NSE:" + view["symbol"]).values,
+        "Company": view["company"].values,
+        "Signal": [signal(x, final) for x in view["n_failed"]],
+        "Score": view[score_col].values,
+    })
+    for k in keys:
+        t[SHORT[k]] = view[k].map(ICONS).values
+    return t
+
+
+def show(t):
+    st.dataframe(t, hide_index=True, width="stretch", height=min(620, 38 + 35 * len(t)),
+                 column_config={
+                     **check_help,
+                     "Chart": st.column_config.LinkColumn("Chart", display_text="TradingView ↗"),
+                     "Score": st.column_config.TextColumn("Score", help="Checks passed"),
+                     "Final": st.column_config.TextColumn("Final", help="Final Entry checks passed"),
+                 })
+
+
+tab_res, tab_chart = st.tabs(["📋 Results", "📈 Chart"])
+
+with tab_res:
+    if view.empty:
+        st.warning("No stock meets this setup right now: no trade.")
+    else:
+        st.markdown("#### ✅ Final Entry Check")
+        main = check_table(final_keys, "Final").rename(columns={"Score": "Final"})
+        show(main)
+        st.caption("✅ pass · ❌ fail · ➖ not checked — hover a column header for its rule")
+
+        for g in ["ATH Dashboard", "Multi RS"]:
+            with st.expander(f"📊 {g} conditions — click to show", expanded=False):
+                show(check_table(s.GROUPS[g], g))
+
+        csv = main.drop(columns="Chart").assign(
+            Signal=lambda d: d["Signal"].str[2:],
+            Final=lambda d: d["Final"].str.replace("/", " of "),  # avoid Excel date conversion
+        ).replace(list(ICONS.values()), ["PASS", "FAIL", "-"])
+        stamp = dt.datetime.now().strftime("%Y%m%d_%H%M")
+        st.download_button("⬇️ Export CSV", csv.to_csv(index=False).encode("utf-8-sig"),
+                           f"cheat_entry_{stamp}.csv", "text/csv")
+        if res["watch"]:
+            skipped = sorted({x.removesuffix(".NS") for x in res["syms"]} - set(view["symbol"]))
+            if skipped:
+                st.caption(f"⚠️ Skipped: {', '.join(skipped)} (less than 5 years of data, or wrong symbol)")
+
+with tab_chart:
+    pool = list(view["symbol"]) if len(view) else []
+    if not pool:
+        st.info("No stocks to chart.")
+    else:
+        sym = st.selectbox("Stock", pool)
+        row = all_df.set_index("symbol").loc[sym]
+        df = weekly(sym + ".NS")
+        if df is None:
+            st.error("No chart data.")
+        else:
+            fig = go.Figure(go.Candlestick(x=df.index, open=df["Open"], high=df["High"],
+                                           low=df["Low"], close=df["Close"], name=sym,
+                                           increasing_line_color="#26a69a",
+                                           decreasing_line_color="#ef5350"))
+            fig.add_scatter(x=df.index, y=df["Close"].rolling(s.CFG["sma_weeks"]).mean(),
+                            name="40W SMA", line=dict(color="#f4b400", width=1.5))
+            for col, name, colr, dash in [("ath", "ATH", "#ef5350", "dash"),
+                                          ("fib382_price", "0.382 Fib", "#42a5f5", "dot"),
+                                          ("avwap_ath", "AVWAP (ATH)", "#ab47bc", "dash"),
+                                          ("swing_low", "Swing low", "#26a69a", "dot")]:
+                fig.add_hline(y=row[col], line=dict(color=colr, dash=dash, width=1),
+                              annotation_text=f"{name} {row[col]:,.2f}",
+                              annotation_position="right")
+            fig.update_layout(template="plotly_dark", height=560, xaxis_rangeslider_visible=False,
+                              margin=dict(l=10, r=10, t=30, b=10), title=f"{sym} · weekly",
+                              legend=dict(orientation="h", y=1.05))
+            st.plotly_chart(fig, width="stretch")
