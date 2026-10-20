@@ -1,6 +1,6 @@
 """
 Cheat Entry Ranking System | Streamlit dashboard (Hugging Face Spaces).
-Run locally: streamlit run app.py
+Run locally:  streamlit run app.py
 The screening logic lives in screener.py.
 """
 import datetime as dt
@@ -13,7 +13,7 @@ import screener as s
 
 st.set_page_config(page_title="Cheat Entry Ranking System", page_icon="⚡", layout="wide")
 
-CACHE_TTL = 4 * 3600  # scans are shared by all users for 4 hours
+CACHE_TTL = 4 * 3600                       # scans are shared by all users for 4 hours
 SETUPS = [g for g in s.GROUPS if g != "All conditions"]
 ICONS = {"Y": "✅", "N": "❌", "-": "➖"}
 
@@ -86,9 +86,31 @@ def symbols(index):
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def scan(syms, names, group, check_all):
-    sl, all_df = s.run_scan(list(syms), dict(names), lambda *_: None, group, check_all)
+def scan(syms, names, group, check_all, _progress=None):
+    # "_progress" starts with "_" so Streamlit does not use it in the cache key
+    sl, all_df = s.run_scan(list(syms), dict(names), lambda *_: None, group, check_all,
+                            progress=_progress)
     return sl, all_df
+
+
+def progress_bar(total):
+    """Progress bar with % done, items remaining and estimated time left."""
+    bar = st.progress(0.0, text=f"Starting scan of {total} stocks...")
+    t0, last = dt.datetime.now(), {"pct": -1}
+
+    def update(frac, text):
+        pct = int(frac * 100)
+        if pct == last["pct"] and frac < 1:      # redraw only when % changes
+            return
+        last["pct"] = pct
+        secs = (dt.datetime.now() - t0).total_seconds()
+        eta = ""
+        if 0.05 < frac < 1:
+            left = int(secs / frac * (1 - frac))
+            eta = f" · ~{left // 60}m {left % 60:02d}s left"
+        bar.progress(min(frac, 1.0), text=f"**{pct}%** · {text}{eta}")
+
+    return bar, update
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
@@ -110,9 +132,14 @@ with st.sidebar:
     else:
         st.caption("~2,000 stocks · first run takes 5-10 minutes")
     go_btn = st.button("⚡ SCAN", type="primary", width="stretch")
+    stop_slot = st.empty()                      # "Stop scan" button appears here while scanning
     if st.button("🔄 Clear cache", width="stretch"):
         st.cache_data.clear()
         st.session_state.pop("res", None)
+
+
+def _request_stop():
+    st.session_state["stopped"] = True
 
 
 # ====================================================================== HEADER
@@ -140,11 +167,22 @@ if go_btn:
         else:
             names = symbols(index)
             syms = list(names)
-        with st.spinner(f"Scanning {len(syms)} stocks... this can take a few minutes"):
-            sl, all_df = scan(tuple(syms), tuple(sorted(names.items())), group, is_watch)
+        bar, update = progress_bar(len(syms))
+        st.session_state["stopped"] = False
+        # Clicking Stop makes Streamlit rerun the page, which interrupts this scan at the
+        # next progress update; screener then cancels the remaining downloads.
+        stop_slot.button("⏹ Stop scan", width="stretch", on_click=_request_stop, key="stop_btn")
+        sl, all_df = scan(tuple(syms), tuple(sorted(names.items())), group, is_watch,
+                          _progress=update)
+        bar.empty()
+        stop_slot.empty()
         st.session_state["res"] = dict(sl=sl, all_df=all_df, group=group, watch=is_watch, syms=syms)
     except Exception as e:
         st.error(f"Scan failed: {e}")
+
+if st.session_state.pop("stopped", False):
+    st.warning("⏹ Scan stopped. Press **⚡ SCAN** to start again."
+               + (" Showing the previous results." if st.session_state.get("res") else ""))
 
 res = st.session_state.get("res")
 if not res:
@@ -207,7 +245,7 @@ with tab_res:
 
         csv = main.drop(columns="Chart").assign(
             Signal=lambda d: d["Signal"].str[2:],
-            Final=lambda d: d["Final"].str.replace("/", " of "),  # avoid Excel date conversion
+            Final=lambda d: d["Final"].str.replace("/", " of "),   # avoid Excel date conversion
         ).replace(list(ICONS.values()), ["PASS", "FAIL", "-"])
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M")
         st.download_button("⬇️ Export CSV", csv.to_csv(index=False).encode("utf-8-sig"),

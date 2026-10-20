@@ -183,31 +183,49 @@ def _history(t, period, interval):
                 df.index = df.index.tz_localize(None)
             return df.dropna(subset=["Close"])
         except Exception:
-            if i < CFG["retries"]:
-                time.sleep(5 * (2 ** i))
+            time.sleep(2 * (i + 1))
     return None
 
 
-def pmap(fn, items):
-    """fn over items in parallel threads -> {item: result}."""
+def pmap(fn, items, progress=None):
+    """fn over items in parallel threads -> {item: result}.
+    progress(done, total) is called after each item (optional); if it raises
+    (e.g. user pressed Stop), pending work is cancelled."""
+    out, n = {}, len(items)
     with ThreadPoolExecutor(CFG["workers"]) as ex:
-        return dict(zip(items, ex.map(fn, items)))
+        try:
+            for i, (t, r) in enumerate(zip(items, ex.map(fn, items)), 1):
+                out[t] = r
+                if progress:
+                    progress(i, n)
+        except BaseException:
+            ex.shutdown(wait=False, cancel_futures=True)
+            raise
+    return out
 
 
-def download(tickers, min_weeks, log):
+def download(tickers, min_weeks, log, progress=None):
     """Weekly candles for many tickers. FIRST FILTER: fewer than min_weeks
-    candles (5 years for stocks) -> skipped before any condition is checked."""
+    candles (5 years for stocks) -> skipped before any condition is checked.
+    progress(done, total) is called after each ticker (optional); if it raises
+    (e.g. user pressed Stop), pending downloads are cancelled."""
     out, short, n = {}, [], len(tickers)
     with ThreadPoolExecutor(CFG["workers"]) as ex:
         res = ex.map(lambda t: _history(t, CFG["history"], "1wk"), tickers)
-        for i, (t, df) in enumerate(zip(tickers, res), 1):
-            if df is not None and len(df) >= min_weeks:
-                out[t] = df
-            elif df is not None:
-                short.append(t.removesuffix(".NS"))
-            if i % 100 == 0 or i == n:
-                log(f"  downloaded {i}/{n} (ok {len(out)}, <5y skipped {len(short)}, "
-                    f"no data {i - len(out) - len(short)})")
+        try:
+            for i, (t, df) in enumerate(zip(tickers, res), 1):
+                if progress:
+                    progress(i, n)
+                if df is not None and len(df) >= min_weeks:
+                    out[t] = df
+                elif df is not None:
+                    short.append(t.removesuffix(".NS"))
+                if i % 100 == 0 or i == n:
+                    log(f"  downloaded {i}/{n} (ok {len(out)}, <5y skipped {len(short)}, "
+                        f"no data {i - len(out) - len(short)})")
+        except BaseException:
+            ex.shutdown(wait=False, cancel_futures=True)
+            raise
     if short:
         log(f"  less than 5 years of data: {', '.join(sorted(short)[:15])}"
             + (" ..." if len(short) > 15 else ""))
@@ -317,25 +335,35 @@ def evaluate(df, idx):
 
 
 # ====================================================================== SCAN
-def run_scan(symbols, names=None, log=print, group=FINAL, check_all=False):
+def run_scan(symbols, names=None, log=print, group=FINAL, check_all=False, progress=None):
     """Returns (shortlist, all_results). check_all=True fetches market cap and
-    daily SMAs for every stock (manual mode), not only for possible passers."""
+    daily SMAs for every stock (manual mode), not only for possible passers.
+    progress(fraction 0-1, text) is called while scanning (optional)."""
     names = names or {}
+    final, keys = group == FINAL, GROUPS[group]
+
+    def step(lo, hi, label):
+        """progress callback mapping done/total of one phase onto lo..hi."""
+        if not progress:
+            return None
+        return lambda i, n: progress(lo + (hi - lo) * i / max(n, 1),
+                                     f"{label}: {i} / {n} ({n - i} remaining)")
+
     log("Downloading index data...")
-    raw = download([t for ts in INDICES.values() for t in ts], 60, lambda *_: None)
+    raw = download([t for ts in INDICES.values() for t in ts], 60, lambda *_: None,
+                   step(0.0, 0.05, "Benchmark indices"))
     idx = {}
     for key, ts in INDICES.items():
         t = next((t for t in ts if t in raw), None)
         if t is None:
-            raise RuntimeError(
-                f"No Yahoo Finance history for {key} (tried {', '.join(ts)}). "
-                "Yahoo Finance may be temporarily rate-limiting requests; wait a few minutes and retry."
-            )
+            raise RuntimeError(f"No index data for {key}; update INDICES")
         idx[key] = raw[t]["Close"]
 
     log(f"Downloading weekly data for {len(symbols)} stocks (< 5 years of data = skipped)...")
     rows = []
-    for t, df in download(symbols, CFG["years_weeks"], log).items():
+    stock_hi = 0.85 if (final or check_all) else 0.9
+    for t, df in download(symbols, CFG["years_weeks"], log,
+                          step(0.05, stock_hi, "Weekly data")).items():
         try:
             m, ck = evaluate(df, idx)
         except Exception as e:
@@ -344,7 +372,6 @@ def run_scan(symbols, names=None, log=print, group=FINAL, check_all=False):
         rows.append({"symbol": t.removesuffix(".NS"), "company": names.get(t, ""), **m, "ck": ck})
 
     # C1 market cap and F3 daily SMAs are slow -> only for stocks that can still pass
-    final, keys = group == FINAL, GROUPS[group]
 
     def alive(ck):
         if check_all:
@@ -357,8 +384,14 @@ def run_scan(symbols, names=None, log=print, group=FINAL, check_all=False):
     cand = [r["symbol"] + ".NS" for r in rows if alive(r["ck"])]
     log(f"Fetching market cap{' + daily SMAs' if final or check_all else ''} "
         f"for {len(cand)} candidates...")
-    mcap = pmap(mcap_cr, cand)
-    dsma = pmap(daily_sma, cand) if final or check_all else {}
+    if final or check_all:
+        mcap = pmap(mcap_cr, cand, step(0.85, 0.92, "Market cap"))
+        dsma = pmap(daily_sma, cand, step(0.92, 1.0, "Daily SMAs"))
+    else:
+        mcap = pmap(mcap_cr, cand, step(0.9, 1.0, "Market cap"))
+        dsma = {}
+    if progress:
+        progress(1.0, "Done")
 
     score = lambda ck, g: f"{sum(bool(ck[x]) for x in GROUPS[g])}/{len(GROUPS[g])}"
     for r in rows:
