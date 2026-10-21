@@ -11,7 +11,7 @@ import streamlit as st
 
 import screener as s
 
-st.set_page_config(page_title="Cheat Entry Ranking System", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Cheat Entry Precondition Scanner", page_icon="⚡", layout="wide")
 
 CACHE_TTL = 4 * 3600                       # scans are shared by all users for 4 hours
 SETUPS = [g for g in s.GROUPS if g != "All conditions"]
@@ -23,7 +23,8 @@ SHORT = {
     "C5": "RS Nifty50", "C6": "RS CNX500", "C7": "RS Midcap50", "C8": "RS Smallcap250",
     "C9": "Vol Surge", "C10": "Red Vol Dry", "C11": "Small Wick", "C12": "Vol Ratio",
     "C13": "RSI > 55", "F1": "Prior Trend", "F2": "Above Fib", "F3": "Above DMAs",
-    "F4": "ATH Room", "F5": "ATH Dash OK", "F6": "Multi RS OK", "F7": "Above AVWAP",
+    "F4": "ATH Room", "F5": "AT Dash OK", "F6": "Multi RS OK", "F7": "Above AVWAP",
+    "C14": "RS Sector",
 }
 
 
@@ -53,7 +54,7 @@ div[data-testid="stDataFrame"]{border-radius:12px;overflow:hidden}
 
 
 # ====================================================================== ABOUT
-@st.dialog("ℹ️ About — Cheat Entry Ranking System", width="large")
+@st.dialog("ℹ️ About — Cheat Entry preconditions scanner", width="large")
 def about():
     st.markdown("""
 Scans NSE stocks on the **weekly chart** and ranks positional swing *cheat entries*:
@@ -68,14 +69,17 @@ turning up again with relative strength and volume.
 | Signal | Meaning |
 |---|---|
 | 🟢 **PASS** | every check of the setup passes |
-| 🟡 **WATCH** | only one check missed (ATH Dashboard / Multi RS only) |
+| 🟡 **WATCH** | only one check missed (AT Dashboard / Multi RS only) |
 | 🔴 **FAIL** | setup not met |
 """)
     for g in SETUPS:
         keys = s.GROUPS[g]
         with st.expander(f"**{g}** — {len(keys)} checks", expanded=g == s.FINAL):
             st.markdown(rules_md(keys))
-    st.markdown("**Benchmarks:** CNX500 · NIFTY 50 · NIFTY Midcap 50 · NIFTY Smallcap 250")
+    st.markdown("**Benchmarks:** CNX500 · NIFTY 50 · NIFTY Midcap 50 · NIFTY Smallcap 250 · "
+                "own sector index (Bank, IT, Pharma, Auto, FMCG, Metal, Realty, Media, Oil & Gas, "
+                "Healthcare, Consumer Durables, Financial Services, Energy, Infra; "
+                "other stocks: Industrials / Nifty India Manufacturing)")
     st.caption("Weekly signals are final after the Friday close. For education only, not investment advice.")
 
 
@@ -145,8 +149,8 @@ def _request_stop():
 # ====================================================================== HEADER
 _, mid, right = st.columns([1, 6, 1], vertical_alignment="center")
 with mid:
-    st.markdown("""<div class="hero"><h1>⚡ Cheat Entry</h1>
-<p>Cheat Entry Ranking System</p></div>""", unsafe_allow_html=True)
+    st.markdown("""<div class="hero"><h1>Cheat Entry</h1>
+<p>Cheat Entry Precondition Scanner</p></div>""", unsafe_allow_html=True)
 with right:
     if st.button("ℹ️ About", width="stretch"):
         about()
@@ -155,30 +159,49 @@ with right:
 # ====================================================================== RUN SCAN
 if go_btn:
     is_watch = universe == "Watchlist"
-    try:
-        if is_watch:
-            syms = s.parse_manual(watch)
-            if not syms:
-                st.error("Type at least one symbol."); st.stop()
-            try:
-                names = symbols(None)
-            except Exception:
-                names = {}
-        else:
+    syms, names = [], {}
+    if is_watch:
+        syms = s.parse_manual(watch)
+        if not syms:
+            st.error("Type at least one symbol, e.g. `HAL, TCS`.")
+            st.stop()
+        try:
+            names = symbols(None)                # company names only; optional
+        except s.ScreenerError:
+            st.toast("NSE list unavailable: company names will be blank.", icon="⚠️")
+    else:
+        try:
             names = symbols(index)
-            syms = list(names)
-        bar, update = progress_bar(len(syms))
-        st.session_state["stopped"] = False
-        # Clicking Stop makes Streamlit rerun the page, which interrupts this scan at the
-        # next progress update; screener then cancels the remaining downloads.
-        stop_slot.button("⏹ Stop scan", width="stretch", on_click=_request_stop, key="stop_btn")
+        except s.ScreenerError as e:
+            st.error(f"📡 Could not load the stock list. {e}")
+            st.stop()
+        syms = list(names)
+        if not syms:
+            st.error("The stock list from NSE is empty. Try again later.")
+            st.stop()
+
+    bar, update = progress_bar(len(syms))
+    st.session_state["stopped"] = False
+    # Clicking Stop makes Streamlit rerun the page, which interrupts this scan at the
+    # next progress update; screener then cancels the remaining downloads.
+    stop_slot.button("⏹ Stop scan", width="stretch", on_click=_request_stop, key="stop_btn")
+    try:
         sl, all_df = scan(tuple(syms), tuple(sorted(names.items())), group, is_watch,
                           _progress=update)
+    except s.ScreenerError as e:                 # expected: data source down, bad input
+        st.error(f"📡 Scan failed: {e}")
+    except Exception as e:                       # unexpected bug: show details
+        st.error(f"Unexpected error during scan: {e.__class__.__name__}: {e}")
+        with st.expander("Error details"):
+            st.exception(e)
+    else:
+        if all_df.empty:
+            st.warning("No stock could be scanned: symbols are wrong, have less than 5 years "
+                       "of data, or Yahoo Finance is not responding.")
+        st.session_state["res"] = dict(sl=sl, all_df=all_df, group=group, watch=is_watch, syms=syms)
+    finally:
         bar.empty()
         stop_slot.empty()
-        st.session_state["res"] = dict(sl=sl, all_df=all_df, group=group, watch=is_watch, syms=syms)
-    except Exception as e:
-        st.error(f"Scan failed: {e}")
 
 if st.session_state.pop("stopped", False):
     st.warning("⏹ Scan stopped. Press **⚡ SCAN** to start again."
@@ -239,9 +262,12 @@ with tab_res:
         show(main)
         st.caption("✅ pass · ❌ fail · ➖ not checked — hover a column header for its rule")
 
-        for g in ["ATH Dashboard", "Multi RS"]:
+        for g in ["AT Dashboard", "Multi RS"]:
             with st.expander(f"📊 {g} conditions — click to show", expanded=False):
-                show(check_table(s.GROUPS[g], g))
+                t = check_table(s.GROUPS[g], g)
+                if g == "Multi RS" and "sector" in view:
+                    t.insert(5, "Sector", view["sector"].values)
+                show(t)
 
         csv = main.drop(columns="Chart").assign(
             Signal=lambda d: d["Signal"].str[2:],
@@ -262,9 +288,13 @@ with tab_chart:
     else:
         sym = st.selectbox("Stock", pool)
         row = all_df.set_index("symbol").loc[sym]
-        df = weekly(sym + ".NS")
-        if df is None:
-            st.error("No chart data.")
+        try:
+            df = weekly(sym + ".NS")
+        except Exception as e:
+            df = None
+            st.caption(f"Chart download error: {e}")
+        if df is None or df.empty:
+            st.error("No chart data from Yahoo Finance right now. Try again later.")
         else:
             fig = go.Figure(go.Candlestick(x=df.index, open=df["Open"], high=df["High"],
                                            low=df["Low"], close=df["Close"], name=sym,
@@ -276,6 +306,8 @@ with tab_chart:
                                           ("fib382_price", "0.382 Fib", "#42a5f5", "dot"),
                                           ("avwap_ath", "AVWAP (ATH)", "#ab47bc", "dash"),
                                           ("swing_low", "Swing low", "#26a69a", "dot")]:
+                if pd.isna(row.get(col)):
+                    continue                     # level not available for this stock
                 fig.add_hline(y=row[col], line=dict(color=colr, dash=dash, width=1),
                               annotation_text=f"{name} {row[col]:,.2f}",
                               annotation_position="right")

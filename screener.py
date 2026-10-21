@@ -70,21 +70,46 @@ LABELS = {
     "C11": "Upper wick < 25%",
     "C12": "Volume ratio (10W) > 1",
     "C13": "Weekly RSI(14) > 55",
+    "C14": "RS vs own sector index (11W) > 0",
     "F1": "Prior uptrend: no retrace > 0.50 fib & rising",
     "F2": "Price above 0.382 fib (ATH -> correction low)",
     "F3": "CMP > 50, 150 & 200-day SMA",
     "F4": "CMP more than 10% below ATH",
-    "F5": "ATH Dashboard: all 6 pass",
+    "F5": "AT Dashboard: all 6 pass",
     "F6": "Multi RS: all pass or only 1 missed",
     "F7": "Weekly close > anchored VWAP (from ATH)",
 }
 FINAL = "Final Entry Check"
 GROUPS = {
     FINAL: [f"F{i}" for i in range(1, 8)],                  # strict PASS / FAIL
-    "ATH Dashboard": ["C1", "C4", "C9", "C11", "C12", "C13"],
-    "Multi RS": ["C2", "C3", "C5", "C6", "C7", "C8", "C10"],
-    "All conditions": [f"C{i}" for i in range(1, 14)],
+    "AT Dashboard": ["C1", "C4", "C9", "C11", "C12", "C13"],
+    "Multi RS": ["C5", "C6", "C7", "C8", "C14"],
+    "All conditions": [f"C{i}" for i in range(1, 15)],
 }
+
+# C14 sector benchmark. A stock uses the FIRST sector whose NSE constituent list contains it.
+# Yahoo has full history only for a few sector indices; for the others an equal-weight
+# index is built from the constituents' weekly closes.
+# (name, NSE list file "indices/ind_<file>list.csv", Yahoo ticker or None)
+SECTORS = [
+    ("Nifty Bank", "niftybank", "^NSEBANK"),
+    ("Nifty IT", "niftyit", "^CNXIT"),
+    ("Nifty Pharma", "niftypharma", "^CNXPHARMA"),
+    ("Nifty Auto", "niftyauto", None),
+    ("Nifty FMCG", "niftyfmcg", None),
+    ("Nifty Metal", "niftymetal", None),
+    ("Nifty Realty", "niftyrealty", None),
+    ("Nifty Media", "niftymedia", None),
+    ("Nifty Oil & Gas", "niftyoilgas", None),
+    ("Nifty Healthcare", "niftyhealthcare", None),
+    ("Nifty Consumer Durables", "niftyconsumerdurables", None),
+    ("Nifty Financial Services", "niftyfinance", None),
+    ("Nifty Energy", "niftyenergy", None),
+    ("Nifty Infrastructure", "niftyinfra", None),
+]
+# Fallback when a stock is in none of the lists above. BSE Industrials has no data on
+# Yahoo Finance, so the closest NSE equivalent is used.
+FALLBACK_SECTOR = ("Industrials (Nifty India Manufacturing)", "niftyindiamanufacturing_", None)
 
 NSE_URLS = ["https://archives.nseindia.com/content/",
             "https://nsearchives.nseindia.com/content/"]
@@ -137,31 +162,56 @@ INDEX_LISTS = {
 }
 
 
+# ====================================================================== ERRORS
+class ScreenerError(RuntimeError):
+    """Base error for problems the user should see (bad input, data source down)."""
+
+
+class DataSourceError(ScreenerError):
+    """NSE or Yahoo Finance did not return usable data."""
+
+
+log_ = logging.getLogger("screener")
+
+
 # ====================================================================== SYMBOLS
 def _nse_csv(path):
-    err = None
+    """Download one CSV from the NSE archives (tries each mirror)."""
+    errors = []
     for base in NSE_URLS:
         try:
             r = requests.get(base + path, timeout=30, headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124"})
             r.raise_for_status()
             df = pd.read_csv(io.StringIO(r.text))
-            df.columns = df.columns.str.strip()
-            return df
-        except Exception as e:
-            err = e
-    raise RuntimeError(f"Could not download from NSE ({err})")
+        except requests.RequestException as e:
+            errors.append(f"{base}: {e.__class__.__name__}")
+            continue
+        except (pd.errors.ParserError, pd.errors.EmptyDataError) as e:
+            errors.append(f"{base}: bad CSV ({e})")
+            continue
+        df.columns = df.columns.str.strip()
+        return df
+    raise DataSourceError(f"NSE list '{path}' could not be downloaded ({'; '.join(errors)}). "
+                          "NSE may be down or blocking this network; try again later.")
 
 
 def nse_symbols(index=None):
     """{"TCS.NS": "Tata Consultancy Services Ltd.", ...} for one index,
     or for all NSE equity (SERIES == EQ) stocks when index is None."""
     if index:
+        if index not in INDEX_LISTS:
+            raise ValueError(f"Unknown index '{index}'")
         df, sym, name = _nse_csv(f"indices/ind_{INDEX_LISTS[index][0]}list.csv"), "Symbol", "Company Name"
     else:
         df, sym, name = _nse_csv("equities/EQUITY_L.csv"), "SYMBOL", "NAME OF COMPANY"
-        df = df[df["SERIES"].str.strip() == "EQ"]
-    return {f"{s.strip()}.NS": n.strip() for s, n in zip(df[sym], df[name])}
+        if "SERIES" in df:
+            df = df[df["SERIES"].astype(str).str.strip() == "EQ"]
+    missing = {sym, name} - set(df.columns)
+    if missing:
+        raise DataSourceError(f"NSE list format changed: missing column(s) {sorted(missing)}")
+    df = df.dropna(subset=[sym])
+    return {f"{str(s).strip()}.NS": str(n).strip() for s, n in zip(df[sym], df[name])}
 
 
 def parse_manual(text):
@@ -172,19 +222,35 @@ def parse_manual(text):
 
 # ====================================================================== DOWNLOAD
 def _history(t, period, interval):
-    """Candles from Yahoo (retries on timeout); None = no data."""
+    """Candles from Yahoo (retries on network errors / rate limits); None = no data."""
     for i in range(CFG["retries"] + 1):
         try:
             df = yf.Ticker(t).history(period=period, interval=interval,
                                       auto_adjust=True, timeout=CFG["timeout"])
-            if df.empty:
-                return None
-            if df.index.tz is not None:
-                df.index = df.index.tz_localize(None)
-            return df.dropna(subset=["Close"])
-        except Exception:
-            time.sleep(2 * (i + 1))
+        except Exception as e:                  # yfinance raises many types (network, rate limit, JSON)
+            log_.debug("%s: attempt %d failed: %s", t, i + 1, e)
+            if i < CFG["retries"]:
+                time.sleep(2 * (i + 1))
+            continue
+        if df is None or df.empty or "Close" not in df:
+            return None                          # delisted / wrong symbol: no point retrying
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+        df = df.dropna(subset=["Close"])
+        return df if len(df) else None
+    log_.warning("%s: no data after %d attempts", t, CFG["retries"] + 1)
     return None
+
+
+def _safe(fn):
+    """Wrap fn so one bad ticker returns None instead of aborting the whole scan."""
+    def run(t):
+        try:
+            return fn(t)
+        except Exception as e:
+            log_.warning("%s: %s failed: %s", t, getattr(fn, "__name__", "task"), e)
+            return None
+    return run
 
 
 def pmap(fn, items, progress=None):
@@ -194,7 +260,7 @@ def pmap(fn, items, progress=None):
     out, n = {}, len(items)
     with ThreadPoolExecutor(CFG["workers"]) as ex:
         try:
-            for i, (t, r) in enumerate(zip(items, ex.map(fn, items)), 1):
+            for i, (t, r) in enumerate(zip(items, ex.map(_safe(fn), items)), 1):
                 out[t] = r
                 if progress:
                     progress(i, n)
@@ -211,7 +277,7 @@ def download(tickers, min_weeks, log, progress=None):
     (e.g. user pressed Stop), pending downloads are cancelled."""
     out, short, n = {}, [], len(tickers)
     with ThreadPoolExecutor(CFG["workers"]) as ex:
-        res = ex.map(lambda t: _history(t, CFG["history"], "1wk"), tickers)
+        res = ex.map(_safe(lambda t: _history(t, CFG["history"], "1wk")), tickers)
         try:
             for i, (t, df) in enumerate(zip(tickers, res), 1):
                 if progress:
@@ -235,9 +301,11 @@ def download(tickers, min_weeks, log, progress=None):
 def mcap_cr(t):
     """C1: market cap in crore (1 Cr = 1e7 rupees); NaN if unknown."""
     try:
-        return yf.Ticker(t).fast_info["marketCap"] / 1e7
-    except Exception:
+        cap = yf.Ticker(t).fast_info["marketCap"]
+    except Exception as e:                      # network error, missing key, bad JSON
+        log_.debug("%s: market cap unavailable: %s", t, e)
         return np.nan
+    return cap / 1e7 if cap else np.nan
 
 
 def daily_sma(t):
@@ -334,12 +402,72 @@ def evaluate(df, idx):
     return m, {key: bool(x) for key, x in ck.items()}   # NaN comparisons -> False
 
 
+# ====================================================================== SECTORS
+_SECTOR_LISTS = {}
+
+
+def sector_members(file):
+    """Set of 'XYZ.NS' tickers in one NSE index list (cached; empty set if unavailable)."""
+    if file not in _SECTOR_LISTS:
+        try:
+            _SECTOR_LISTS[file] = set(nse_symbols_file(file))
+        except (ScreenerError, KeyError) as e:
+            log_.warning("sector list %s unavailable: %s", file, e)
+            _SECTOR_LISTS[file] = set()
+    return _SECTOR_LISTS[file]
+
+
+def nse_symbols_file(file):
+    df = _nse_csv(f"indices/ind_{file}list.csv")
+    if "Symbol" not in df:
+        raise DataSourceError(f"NSE list '{file}' has no 'Symbol' column")
+    return [f"{str(x).strip()}.NS" for x in df["Symbol"].dropna()]
+
+
+def sector_benchmarks(tickers, have, log, progress=None):
+    """C14 helper -> ({ticker: sector name}, {sector name: 11-week return}).
+    Sector return = Yahoo index if available, else equal-weight average of the
+    constituents' 11-week returns. Stocks in no sector list use FALLBACK_SECTOR."""
+    w = CFG["rs_weeks"]
+    sec_of = {}
+    for t in tickers:
+        sec = next((sec for sec in SECTORS if t in sector_members(sec[1])), FALLBACK_SECTOR)
+        sec_of[t] = sec
+    used = set(sec_of.values())
+
+    # download what is missing: Yahoo sector indices + constituents not already scanned
+    need = {sec[2] for sec in used if sec[2]}
+    for sec in used:
+        if not sec[2]:
+            need |= sector_members(sec[1]) - set(have)
+    need = sorted(need)
+    log(f"Sector benchmarks: {len(used)} sectors, downloading {len(need)} extra series...")
+    extra = download(need, w + 2, lambda *_: None, progress) if need else {}
+    data = {**have, **extra}
+
+    ret = lambda c: c.iloc[-1] / c.iloc[-1 - w] - 1
+    sec_ret = {}
+    for name, file, yt in used:
+        if yt and yt in data:
+            sec_ret[name] = ret(data[yt]["Close"])
+        else:
+            rs = [ret(data[m]["Close"]) for m in sector_members(file)
+                  if m in data and len(data[m]) > w]
+            if rs:
+                sec_ret[name] = float(np.mean(rs))
+    return {t: sec[0] for t, sec in sec_of.items()}, sec_ret
+
+
 # ====================================================================== SCAN
 def run_scan(symbols, names=None, log=print, group=FINAL, check_all=False, progress=None):
     """Returns (shortlist, all_results). check_all=True fetches market cap and
     daily SMAs for every stock (manual mode), not only for possible passers.
     progress(fraction 0-1, text) is called while scanning (optional)."""
     names = names or {}
+    if group not in GROUPS:
+        raise ValueError(f"Unknown setup '{group}'. Choose one of: {', '.join(GROUPS)}")
+    if not symbols:
+        raise ScreenerError("No symbols to scan.")
     final, keys = group == FINAL, GROUPS[group]
 
     def step(lo, hi, label):
@@ -356,20 +484,39 @@ def run_scan(symbols, names=None, log=print, group=FINAL, check_all=False, progr
     for key, ts in INDICES.items():
         t = next((t for t in ts if t in raw), None)
         if t is None:
-            raise RuntimeError(f"No index data for {key}; update INDICES")
+            raise DataSourceError(f"Yahoo Finance returned no data for benchmark '{key}' "
+                                  f"({', '.join(ts)}). Yahoo may be rate-limiting; try again later.")
         idx[key] = raw[t]["Close"]
 
     log(f"Downloading weekly data for {len(symbols)} stocks (< 5 years of data = skipped)...")
     rows = []
-    stock_hi = 0.85 if (final or check_all) else 0.9
-    for t, df in download(symbols, CFG["years_weeks"], log,
-                          step(0.05, stock_hi, "Weekly data")).items():
+    stock_hi = 0.80 if (final or check_all) else 0.85
+    stocks = download(symbols, CFG["years_weeks"], log, step(0.05, stock_hi, "Weekly data"))
+    if not stocks:
+        log("No stock has 5 years of weekly data (wrong symbols, or Yahoo unavailable).")
+
+    # C14: relative strength vs the stock's own sector index. Optional: if it fails,
+    # the scan continues and C14 counts as failed for every stock.
+    try:
+        sec_of, sec_ret = sector_benchmarks(list(stocks), stocks, log,
+                                            step(stock_hi, stock_hi + 0.05, "Sector indices"))
+    except ScreenerError as e:
+        log(f"Sector benchmarks unavailable ({e}); RS Sector marked as failed.")
+        sec_of, sec_ret = {}, {}
+    w = CFG["rs_weeks"]
+    for t, df in stocks.items():
         try:
             m, ck = evaluate(df, idx)
-        except Exception as e:
-            log(f"  {t}: error {e}")
+        except (ValueError, TypeError, KeyError, IndexError, ZeroDivisionError) as e:
+            log(f"  {t}: skipped, bad data ({e.__class__.__name__}: {e})")
             continue
+        sec = sec_of.get(t)
+        m["sector"] = sec or ""
+        m["rs11w_sector"] = (df["Close"].iloc[-1] / df["Close"].iloc[-1 - w] - 1
+                             - sec_ret[sec]) if sec in sec_ret else np.nan
+        ck["C14"] = bool(m["rs11w_sector"] > 0)                     # no sector data -> fail
         rows.append({"symbol": t.removesuffix(".NS"), "company": names.get(t, ""), **m, "ck": ck})
+    stock_hi += 0.05
 
     # C1 market cap and F3 daily SMAs are slow -> only for stocks that can still pass
 
@@ -401,10 +548,10 @@ def run_scan(symbols, names=None, log=print, group=FINAL, check_all=False, progr
         ck["C1"] = bool(r["mcap_cr"] > CFG["min_mcap_cr"])           # unknown (NaN) -> fail
         ck["F3"] = (all(d["cmp_daily"] > d[f"sma{n}d"] for n in CFG["daily_sma"])
                     if d else None)                                   # None = not checked
-        ck["F5"] = all(ck[x] for x in GROUPS["ATH Dashboard"])
+        ck["F5"] = all(ck[x] for x in GROUPS["AT Dashboard"])
         ck["F6"] = sum(not ck[x] for x in GROUPS["Multi RS"]) <= CFG["multirs_max_miss"]
         failed = [x for x in keys if not ck[x]]
-        r.update({"Final": score(ck, FINAL), "ATH Dashboard": score(ck, "ATH Dashboard"),
+        r.update({"Final": score(ck, FINAL), "AT Dashboard": score(ck, "AT Dashboard"),
                   "Multi RS": score(ck, "Multi RS"), "n_failed": len(failed),
                   "failed": ", ".join(f"{x} {LABELS[x]}" + (" (not checked)" if ck[x] is None else "")
                                       for x in failed)})
@@ -423,7 +570,7 @@ def run_scan(symbols, names=None, log=print, group=FINAL, check_all=False, progr
 
 
 VIEW = {"symbol": "Symbol", "company": "Company", "status": "Signal", "failed": "Missed",
-        "Final": "Final", "ATH Dashboard": "ATH Dash", "Multi RS": "Multi RS",
+        "Final": "Final", "AT Dashboard": "AT Dash", "Multi RS": "Multi RS",
         "close": "CMP", "ath": "ATH", "ath_dist": "Below ATH %", "upside_ath": "Upside to ATH %",
         "fib382_price": "0.382 Fib", "avwap_ath": "AVWAP (ATH)", "sma40w": "40W SMA",
         "swing_low": "Swing low", "fib_level": "Fib level", "rsi14w": "RSI 14W",
