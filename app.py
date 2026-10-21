@@ -317,6 +317,7 @@ with tab_chart:
                               annotation_text=f"{name} {row[col]:,.2f}",
                               annotation_position="right")
             fig.update_layout(template="plotly_dark", height=560, xaxis_rangeslider_visible=False,
+                              dragmode="pan",
                               margin=dict(l=10, r=10, t=30, b=10), title=f"{sym} · weekly",
                               legend=dict(orientation="h", y=1.05))
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, width="stretch", config={"scrollzoom":True})
