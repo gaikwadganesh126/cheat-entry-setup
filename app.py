@@ -20,10 +20,10 @@ ICONS = {"Y": "✅", "N": "❌", "-": "➖"}
 
 # Short, readable names shown in the UI instead of C1..C13 / F1..F7
 SHORT = {
-    "C1": "Mkt Cap", "C2": "5Y Uptrend", "C3": "ATH Pullback", "C4": "RS CNX500 50D",
+    "C1": "Mkt Cap", "C2": "5Y Uptrend", "C3": "ATH Pullback", "C4": "RS vs CNX500",
     "C5": "RS Nifty50", "C6": "RS CNX500", "C7": "RS Midcap50", "C8": "RS Smallcap250",
-    "C9": "Vol Surge", "C10": "Red Vol Dry", "C11": "Small Wick", "C12": "Vol Ratio",
-    "C13": "RSI > 55", "F1": "Prior Trend", "F2": "Above Fib", "F3": "Above DMAs",
+    "C9": "WVol > 20SMA", "C10": "Red Vol Dry", "C11": "Wick % < 25", "C12": "U/D Vol Ratio",
+    "C13": "RSI 14 (W)", "F1": "Prior Trend", "F2": "Above Fib", "F3": "Above DMAs",
     "F4": "ATH Room", "F5": "AT Dash OK", "F6": "Multi RS OK", "F7": "Above AVWAP",
     "C14": "RS Sector",
 }
