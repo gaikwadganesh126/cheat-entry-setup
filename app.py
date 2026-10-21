@@ -261,8 +261,8 @@ with tab_res:
     else:
         sel = res["group"]
         # Only the selected setup is shown; "All conditions" shows every section
-        sections = ([s.FINAL, "AT Dashboard", "Multi RS", ALL] if sel == ALL else [sel])
-        icons = {s.FINAL: "✅", "AT Dashboard": "📊", "Multi RS": "📈", ALL: "🧾"}
+        sections = ([s.FINAL, "AT Dashboard", "Multi RS"] if sel == ALL else [sel])
+        icons = {s.FINAL: "✅", "AT Dashboard": "📊", "Multi RS": "📈"}
         main = None
         for g in sections:
             st.markdown(f"#### {icons.get(g, '📋')} {g}")
