@@ -270,7 +270,7 @@ with tab_res:
             if g == "Multi RS" and "sector" in view:
                 t.insert(5, "Sector", view["sector"].values)
             show(t)
-            if g == sel:
+            if main is None:
                 main = t                         # table exported to CSV
         st.caption("✅ pass · ❌ fail · ➖ not checked — hover a column header for its rule")
 
