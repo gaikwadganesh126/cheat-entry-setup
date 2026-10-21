@@ -14,7 +14,8 @@ import screener as s
 st.set_page_config(page_title="Cheat Entry Precondition Scanner", page_icon="⚡", layout="wide")
 
 CACHE_TTL = 4 * 3600                       # scans are shared by all users for 4 hours
-SETUPS = [g for g in s.GROUPS if g != "All conditions"]
+ALL = "All conditions"
+SETUPS = list(s.GROUPS)                    # Final Entry Check, AT Dashboard, Multi RS, All conditions
 ICONS = {"Y": "✅", "N": "❌", "-": "➖"}
 
 # Short, readable names shown in the UI instead of C1..C13 / F1..F7
@@ -234,7 +235,8 @@ def check_table(keys, score_col):
         "Chart": ("https://www.tradingview.com/chart/?symbol=NSE:" + view["symbol"]).values,
         "Company": view["company"].values,
         "Signal": [signal(x, final) for x in view["n_failed"]],
-        "Score": view[score_col].values,
+        "Score": (view[score_col].values if score_col in view
+                  else [f"{sum(r[k] == 'Y' for k in keys)}/{len(keys)}" for _, r in view.iterrows()]),
     })
     for k in keys:
         t[SHORT[k]] = view[k].map(ICONS).values
@@ -257,21 +259,24 @@ with tab_res:
     if view.empty:
         st.warning("No stock meets this setup right now: no trade.")
     else:
-        st.markdown("#### ✅ Final Entry Check")
-        main = check_table(final_keys, "Final").rename(columns={"Score": "Final"})
-        show(main)
+        sel = res["group"]
+        # Only the selected setup is shown; "All conditions" shows every section
+        sections = ([s.FINAL, "AT Dashboard", "Multi RS", ALL] if sel == ALL else [sel])
+        icons = {s.FINAL: "✅", "AT Dashboard": "📊", "Multi RS": "📈", ALL: "🧾"}
+        main = None
+        for g in sections:
+            st.markdown(f"#### {icons.get(g, '📋')} {g}")
+            t = check_table(s.GROUPS[g], g)
+            if g == "Multi RS" and "sector" in view:
+                t.insert(5, "Sector", view["sector"].values)
+            show(t)
+            if g == sel:
+                main = t                         # table exported to CSV
         st.caption("✅ pass · ❌ fail · ➖ not checked — hover a column header for its rule")
-
-        for g in ["AT Dashboard", "Multi RS"]:
-            with st.expander(f"📊 {g} conditions — click to show", expanded=False):
-                t = check_table(s.GROUPS[g], g)
-                if g == "Multi RS" and "sector" in view:
-                    t.insert(5, "Sector", view["sector"].values)
-                show(t)
 
         csv = main.drop(columns="Chart").assign(
             Signal=lambda d: d["Signal"].str[2:],
-            Final=lambda d: d["Final"].str.replace("/", " of "),   # avoid Excel date conversion
+            Score=lambda d: d["Score"].str.replace("/", " of "),   # avoid Excel date conversion
         ).replace(list(ICONS.values()), ["PASS", "FAIL", "-"])
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M")
         st.download_button("⬇️ Export CSV", csv.to_csv(index=False).encode("utf-8-sig"),
